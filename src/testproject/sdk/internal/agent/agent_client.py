@@ -22,6 +22,7 @@ import uuid
 from urllib.parse import urljoin
 from enum import Enum, unique
 from requests import HTTPError
+from packaging import version
 from src.testproject.classes import ActionExecutionResponse
 from src.testproject.enums import ExecutionResultType
 from src.testproject.executionresults import OperationResult
@@ -43,6 +44,7 @@ from src.testproject.sdk.exceptions import (
 )
 from src.testproject.helpers import SocketHelper
 from src.testproject.sdk.internal.session import AgentSession
+from src.testproject.tcp import SocketManager
 
 
 class AgentClient:
@@ -64,6 +66,12 @@ class AgentClient:
     """
 
     REPORTS_QUEUE_TIMEOUT = 10
+
+    # Minimum Agent version number that supports session reuse
+    MIN_SESSION_REUSE_CAPABLE_VERSION = "0.64.20"
+
+    # Class variable containing the current known Agent version
+    __agent_version: str = None
 
     def __init__(self, token: str, capabilities: dict, reportsettings: ReportSettings):
         self._remote_address = ConfigHelper.get_agent_service_address()
@@ -99,6 +107,8 @@ class AgentClient:
 
         start_session_response = self._request_session_from_agent()
 
+        AgentClient.__agent_version = start_session_response.agent_version
+
         self._agent_session = AgentSession(
             start_session_response.server_address,
             start_session_response.session_id,
@@ -106,12 +116,32 @@ class AgentClient:
             start_session_response.capabilities,
         )
 
-        self._sock = SocketHelper.create_connection(
+        SocketManager.instance().open_socket(
             self._remote_address, start_session_response.dev_socket_port
         )
 
         logging.info("Development session started...")
         return True
+
+    @staticmethod
+    def can_reuse_session() -> bool:
+        """Determine whether the current Agent version supports session reuse
+
+        Returns:
+             bool: True if Agent supports session reuse, False otherwise
+        """
+        if AgentClient.__agent_version is None:
+            return False
+
+        session_is_reusable = version.parse(
+            AgentClient.__agent_version
+        ) >= version.parse(AgentClient.MIN_SESSION_REUSE_CAPABLE_VERSION)
+
+        logging.info(
+            f"Current Agent version {AgentClient.__agent_version} does{'' if session_is_reusable else 'not'} support session reuse"
+        )
+
+        return session_is_reusable
 
     def _request_session_from_agent(self) -> SessionResponse:
         """Creates and sends a session request object
@@ -165,7 +195,7 @@ class AgentClient:
             session_id=session_id,
             dialect=dialect,
             capabilities=capabilities,
-            agent_version=response.data["version"]
+            agent_version=response.data["version"],
         )
         return start_session_response
 
@@ -344,17 +374,10 @@ class AgentClient:
                 f"There are {self._queue.qsize()} unreported items in the queue"
             )
 
-        try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-            self._sock.close()
-            logging.info(
-                f"Connection to Agent at {self._remote_address} closed successfully"
-            )
-        except socket.error as msg:
-            logging.error(
-                f"Failed to close socket connection to Agent at {self._remote_address}: {msg}"
-            )
-            pass
+        if not AgentClient.can_reuse_session():
+            SocketManager.instance().close_socket()
+        else:
+            logging.info("Keeping socket open for future reuse")
 
     @staticmethod
     def __handle_new_session_error(response: OperationResult):
